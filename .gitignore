@@ -1,0 +1,4 @@
+# Ignore dataset folders
+data/
+dataset/
+weights/
