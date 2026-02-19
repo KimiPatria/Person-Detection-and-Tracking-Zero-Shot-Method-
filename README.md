@@ -25,7 +25,7 @@ PyTorch implementation of **Boosting Object Detection with Zero-Shot Day-Night D
 3. - [x] release the training code.
 
 ## :rocket: Installation
-
+conda 
 Begin by cloning the repository and setting up the environment:
 
 ```
