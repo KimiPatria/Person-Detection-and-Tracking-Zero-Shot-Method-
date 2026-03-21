@@ -1,4 +1,6 @@
-# Ignore dataset folders
-data/
+# Ignore dataset folders and weights
 dataset/
 weights/
+
+# Ignore compiled python files in data/
+data/__pycache__/
