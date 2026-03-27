@@ -4,12 +4,15 @@ from __future__ import division
 from __future__ import absolute_import
 from __future__ import print_function
 
+import xml.etree.ElementTree as ET
 import os
 import cv2
 import numpy as np
 from PIL import Image
 from pathlib import Path
+import time
 
+import argparse
 import torch
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
@@ -46,9 +49,22 @@ def to_chw_bgr(image):
     image = image[[2, 1, 0], :, :]
     return image
 
+def letterbox(img, target_size=640):
+    """Resize image preserving aspect ratio and pad to target_size×target_size."""
+    h, w = img.shape[:2]
+    scale = min(target_size / h, target_size / w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((target_size, target_size, 3), dtype=img.dtype)
+    pad_top = (target_size - new_h) // 2
+    pad_left = (target_size - new_w) // 2
+    canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
+    return canvas, scale, pad_left, pad_top
+
+
 def detect_face(img, tmp_shrink):
-    image = cv2.resize(img, None, None, fx=tmp_shrink,
-                       fy=tmp_shrink, interpolation=cv2.INTER_LINEAR)
+    orig_h, orig_w = img.shape[:2]
+    image, scale, pad_left, pad_top = letterbox(img, 640)
 
     x = to_chw_bgr(image)
     x = x.astype('float32')
@@ -56,22 +72,28 @@ def detect_face(img, tmp_shrink):
     x = x[[2, 1, 0], :, :]
 
     x = Variable(torch.from_numpy(x).unsqueeze(0))
-    
+
     if use_cuda:
         x = x.cuda()
 
     y = net.test_forward(x)[0]
     detections = y.data.cpu().numpy()
-    scale = np.array([img.shape[1], img.shape[0], img.shape[1], img.shape[0]])
+    # test_forward returns normalised coords relative to padded 640×640
+    lb_scale = np.array([640, 640, 640, 640])
 
     boxes=[]
     scores = []
     for i in range(detections.shape[1]):
       j = 0
       while ((j < detections.shape[2]) and detections[0, i, j, 0] > 0.0):
-        pt = (detections[0, i, j, 1:] * scale)
+        pt = detections[0, i, j, 1:] * lb_scale  # to padded-pixel coords
         score = detections[0, i, j, 0]
-        boxes.append([pt[0],pt[1],pt[2],pt[3]])
+        # undo letterbox: remove padding, then undo scale
+        x1 = (pt[0] - pad_left) / scale
+        y1 = (pt[1] - pad_top) / scale
+        x2 = (pt[2] - pad_left) / scale
+        y2 = (pt[3] - pad_top) / scale
+        boxes.append([x1, y1, x2, y2])
         scores.append(score)
         j += 1
 
@@ -81,11 +103,7 @@ def detect_face(img, tmp_shrink):
     if boxes.shape[0] == 0:
         return np.array([[0,0,0,0,0.001]])
 
-    det_xmin = boxes[:,0] # / tmp_shrink
-    det_ymin = boxes[:,1] # / tmp_shrink
-    det_xmax = boxes[:,2] # / tmp_shrink
-    det_ymax = boxes[:,3] # / tmp_shrink
-    det = np.column_stack((det_xmin, det_ymin, det_xmax, det_ymax, det_conf))
+    det = np.column_stack((boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3], det_conf))
 
     return det
 
@@ -180,7 +198,7 @@ def bbox_vote(det_):
         o_ = inter / (area_[0] + area_[:] - inter)
 
         # get needed merge det and delete these det
-        merge_index_ = np.where(o_ >= 0.3)[0]
+        merge_index_ = np.where(o_ >= 0.5)[0]
         det_accu_ = det_[merge_index_, :]
         det_ = np.delete(det_, merge_index_, 0)
 
@@ -200,75 +218,203 @@ def bbox_vote(det_):
     return dets_
 
 
-def load_models():
-    print('build network')
-    net = build_net('test', num_classes=2, model='dark')
-    net.eval()
-    net.load_state_dict(torch.load('')) # Set the dir of your model weight
+_WEIGHT_DEFAULTS = {
+    'dark':      'weights/dsfd.pth',
+    'yolo_dark': 'weights/yolo_dark/dsfd.pth',
+}
 
+def load_models(model_type='yolo_dark', weights_path=None):
+    print(f'build network: {model_type}')
+    weights_path = weights_path or _WEIGHT_DEFAULTS[model_type]
+    num_classes  = 1 if model_type == 'yolo_dark' else 2
+    net = build_net('test', num_classes=num_classes, model=model_type)
+    net.eval()
+    ckpt = torch.load(weights_path, map_location='cuda' if use_cuda else 'cpu')
+    if isinstance(ckpt, dict) and 'weight' in ckpt:
+        net.load_state_dict(ckpt['weight'])
+    else:
+        net.load_state_dict(ckpt)
     if use_cuda:
         net = net.cuda()
-
     return net
 
+def calculate_iou(boxA, boxB):
+    # Determine the coordinates of the intersection rectangle
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # Compute the area of intersection
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0:
+        return 0.0
+
+    # Compute the area of both bounding boxes
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+    # Compute IoU
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+    return iou
+
+def voc_ap(rec, prec):
+    # 11-point interpolated average precision (Standard Pascal VOC)
+    ap = 0.
+    for t in np.arange(0., 1.1, 0.1):
+        if np.sum(rec >= t) == 0:
+            p = 0
+        else:
+            p = np.max(prec[rec >= t])
+        ap = ap + p / 11.
+    return ap
+
+def parse_voc_xml(xml_path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    bboxes = []
+    for obj in root.findall('object'):
+        # If you have multiple classes, you can filter by name here:
+        # if obj.find('name').text != 'person': continue
+        bndbox = obj.find('bndbox')
+        xmin = float(bndbox.find('xmin').text)
+        ymin = float(bndbox.find('ymin').text)
+        xmax = float(bndbox.find('xmax').text)
+        ymax = float(bndbox.find('ymax').text)
+        bboxes.append({'bbox': [xmin, ymin, xmax, ymax], 'matched': False})
+    return bboxes
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='DAI-Net test')
+    parser.add_argument('--model',   default='yolo_dark',
+                        choices=['dark', 'yolo_dark'],
+                        help='Model architecture (default: yolo_dark)')
+    parser.add_argument('--weights', default=None,
+                        help='Path to .pth weights file (auto-detected if omitted)')
+    cli = parser.parse_args()
 
     ''' Parameters '''
-
-    USE_MULTI_SCALE = True
+    USE_MULTI_SCALE = False
     MY_SHRINK = 1
 
-    # USE_MULTI_SCALE = False
-    # MY_SHRINK = 2
-
-    save_path = './result/'
+    # Define your paths here
+    images_dir      = './dataset/roboflow/test/images/'
+    annotations_dir = './dataset/roboflow/test/annotations/'
+    save_path       = './result/'
 
     def load_images():
-      imglist = glob.glob('') # Set the dir of your test data
-      return imglist
+        imglist = glob.glob(os.path.join(images_dir, '*.jpg'))
+        return imglist
 
-    ''' Main Test '''
-
-    net = load_models()
+    ''' Main Test & Evaluation '''
+    net = load_models(cli.model, cli.weights)
     img_list = load_images()
 
     if not os.path.exists(save_path):
         os.makedirs(save_path)
+
+    # Dictionaries to store everything for mAP
+    all_detections = []    # Will store: [image_id, confidence, xmin, ymin, xmax, ymax]
+    all_ground_truths = {} # Will store: {image_id: [{'bbox': [...], 'matched': False}, ...]}
+    total_gt_boxes = 0
+
     now = 0
-    print('Processing: {}/{}'.format(now+1, img_list.__len__()))
+    print('Processing and Evaluating: {} images'.format(img_list.__len__()))
+    
     for img_path in img_list:
-        # Load images       
+        image_id = Path(img_path).stem
+        
+        # 1. Load Ground Truth XML
+        xml_path = os.path.join(annotations_dir, image_id + '.xml')
+        if os.path.exists(xml_path):
+            gt_boxes = parse_voc_xml(xml_path)
+            all_ground_truths[image_id] = gt_boxes
+            total_gt_boxes += len(gt_boxes)
+        else:
+            all_ground_truths[image_id] = []
+
+        # 2. Load and Detect Image
         image = Image.open(img_path)
         if image.mode == 'L':
             image = image.convert('RGB')
         image = np.array(image)
 
-        # Face Detection
-        max_im_shrink = (0x7fffffff / 200.0 / (image.shape[0] * image.shape[1])) ** 0.5 # the max size of input image for caffe
-        max_im_shrink = 3 if max_im_shrink > 3 else max_im_shrink
+        start_time = time.time()
 
         if USE_MULTI_SCALE:
+            max_im_shrink = (0x7fffffff / 200.0 / (image.shape[0] * image.shape[1])) ** 0.5 
+            max_im_shrink = 3 if max_im_shrink > 3 else max_im_shrink
             with torch.no_grad():
-                det0 = detect_face(image, MY_SHRINK)  # origin test
-                det1 = flip_test(image, MY_SHRINK)    # flip test
-                [det2, det3] = multi_scale_test(image, max_im_shrink) # multi-scale test
+                det0 = detect_face(image, MY_SHRINK)
+                det1 = flip_test(image, MY_SHRINK)
+                [det2, det3] = multi_scale_test(image, max_im_shrink)
                 det4 = multi_scale_test_pyramid(image, max_im_shrink)
             det = np.row_stack((det0, det1, det2, det3, det4))
             dets = bbox_vote(det)
         else:
             with torch.no_grad():
-                dets = detect_face(image, MY_SHRINK)  # origin test
+                dets = detect_face(image, MY_SHRINK)
 
-        # Save result
-        fout = open(os.path.join(save_path, Path(os.path.basename(img_path)).stem + '.txt'), 'w')
+        inference_time = time.time() - start_time
+        fps = 1.0 / inference_time
 
+        # 3. Store Detections for mAP
         for i in range(dets.shape[0]):
-            xmin = dets[i][0]
-            ymin = dets[i][1]
-            xmax = dets[i][2]
-            ymax = dets[i][3]
             score = dets[i][4]
-            fout.write('{} {} {} {} {}\n'.format(xmin, ymin, xmax, ymax, score))
+            # Optional: Filter out very low confidence boxes early
+            if score > 0.05: 
+                xmin, ymin, xmax, ymax = dets[i][0:4]
+                all_detections.append([image_id, score, xmin, ymin, xmax, ymax])
+
         now += 1
-        print('Processing: {}/{}'.format(now + 1, img_list.__len__()))
+        print('Processed: {}/{} | FPS: {:.2f}'.format(now, len(img_list), fps), end='\r')
+
+    print('\n\n--- Evaluation Results ---')
+    
+    # Sort all detections by confidence (highest first)
+    all_detections.sort(key=lambda x: x[1], reverse=True)
+
+    nd = len(all_detections)
+    tp = np.zeros(nd)
+    fp = np.zeros(nd)
+
+    # 4. Calculate True Positives (TP) and False Positives (FP)
+    for d in range(nd):
+        detection = all_detections[d]
+        image_id = detection[0]
+        bb = detection[2:]
+        
+        ovmax = -np.inf
+        kmax = -1
+        
+        gt_boxes = all_ground_truths.get(image_id, [])
+        
+        for k, gt in enumerate(gt_boxes):
+            bbgt = gt['bbox']
+            iou = calculate_iou(bb, bbgt)
+            if iou > ovmax:
+                ovmax = iou
+                kmax = k
+
+        # Standard IoU threshold is 0.5
+        if ovmax >= 0.5:
+            if not gt_boxes[kmax]['matched']:
+                tp[d] = 1.
+                gt_boxes[kmax]['matched'] = True
+            else:
+                fp[d] = 1. # Multiple detections for same object
+        else:
+            fp[d] = 1.
+
+    # 5. Compute Precision, Recall, and mAP
+    fp = np.cumsum(fp)
+    tp = np.cumsum(tp)
+    
+    rec = tp / float(total_gt_boxes) if total_gt_boxes > 0 else 0
+    prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
+    
+    ap = voc_ap(rec, prec)
+    
+    print(f"Total Ground Truth Objects: {total_gt_boxes}")
+    print(f"Total Detections Made: {nd}")
+    print(f"mAP @ IoU=0.50: {ap * 100:.2f}%")
