@@ -42,6 +42,7 @@ from __future__ import division, absolute_import, print_function
 import os
 import sys
 import copy
+import csv
 import math
 import time
 import argparse
@@ -155,6 +156,11 @@ parser.add_argument('--warmup_epochs', default=3,    type=int,
                     help='Linear LR warmup epochs')
 parser.add_argument('--val_interval', default=3,     type=int,
                     help='Validate every N epochs (saves time)')
+parser.add_argument('--ablation',     default='full', type=str,
+                    choices=['baseline', 'reflectance', 'ref_kl', 'full'],
+                    help='Ablation variant: baseline (detect only), '
+                         'reflectance (+R decoder), ref_kl (+R +KL), '
+                         'full (all components, default)')
 args = parser.parse_args()
 
 # ── Distributed / device setup ───────────────────────────────────────────────
@@ -195,7 +201,13 @@ else:
     scaler = None
 
 # ── Save directory ───────────────────────────────────────────────────────────
-save_folder = os.path.join(args.save_folder, 'yolo_dark')
+_ABLATION_DIRS = {
+    'baseline':    'ablation_baseline',
+    'reflectance': 'ablation_reflectance',
+    'ref_kl':      'ablation_ref_kl',
+    'full':        'yolo_dark',
+}
+save_folder = os.path.join(args.save_folder, _ABLATION_DIRS[args.ablation])
 os.makedirs(save_folder, exist_ok=True)
 
 # ── Dataset (wrapped with DarkAugDataset for parallel DarkISP) ───────────────
@@ -316,9 +328,18 @@ def train():
     # ── Enhance loss (fp32 — uses hardcoded float32 conv kernels) ─────────
     criterion_enhance = EnhanceLoss()
 
+    # ── Ablation flags ────────────────────────────────────────────────────
+    use_reflectance = args.ablation in ('reflectance', 'ref_kl', 'full')
+    use_kl          = args.ablation in ('ref_kl', 'full')
+    use_enhance     = args.ablation == 'full'
+
     if local_rank == 0:
         n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
         print(f'[INFO] Model      : DAI-Net YOLOv8n')
+        print(f'[INFO] Ablation   : {args.ablation}')
+        print(f'[INFO]   Reflectance Decoder : {"ON" if use_reflectance else "OFF"}')
+        print(f'[INFO]   KL Alignment        : {"ON" if use_kl else "OFF"}')
+        print(f'[INFO]   Full EnhanceLoss    : {"ON" if use_enhance else "OFF"}')
         print(f'[INFO] Parameters : {n_params / 1e6:.2f} M')
         print(f'[INFO] Device     : {device}  |  AMP dtype: {amp_dtype}')
         print(f'[INFO] Batch size : {args.batch_size}')
@@ -327,15 +348,34 @@ def train():
         print(f'[INFO] Epochs     : {cfg.EPOCHES}  (warmup: {warmup_epochs})')
         print(f'[INFO] EMA enabled (decay=0.9999)')
         print(f'[INFO] Val every  : {args.val_interval} epochs')
+        print(f'[INFO] Save folder: {save_folder}')
         print(f'[INFO] Starting training …')
+
+    # ── Loss history CSV ────────────────────────────────────────────────
+    loss_csv_path = os.path.join(save_folder, 'loss_history.csv')
+    csv_fields = ['epoch', 'train_loss', 'train_box', 'train_cls',
+                  'train_enh', 'train_kl', 'val_loss', 'lr']
+    # Load existing history if resuming
+    loss_history = []
+    if start_epoch > 0 and os.path.exists(loss_csv_path):
+        with open(loss_csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                loss_history.append(row)
+        if local_rank == 0:
+            print(f'[INFO] Loaded {len(loss_history)} rows from {loss_csv_path}')
 
     for epoch in range(start_epoch, cfg.EPOCHES):
         net.train()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        epoch_loss = 0.0
-        t_epoch    = time.time()
+        epoch_loss     = 0.0
+        epoch_box      = 0.0
+        epoch_cls      = 0.0
+        epoch_enh      = 0.0
+        epoch_kl       = 0.0
+        t_epoch        = time.time()
 
         for batch_idx, (images, img_dark, targets, _) in enumerate(train_loader):
 
@@ -343,41 +383,68 @@ def train():
             images   = images.to(device, dtype=torch.float32) / 255.0
             img_dark = img_dark.to(device, dtype=torch.float32)
 
-            # ── RetinexNet: frozen, fp32, no grad ─────────────────────────
-            with torch.no_grad():
-                R_dark_gt,  I_dark  = net_enh(img_dark)   # fp32
-                R_light_gt, I_light = net_enh(images)     # fp32
-
             gt_list = [t.to(device) for t in targets]
 
-            # ── Forward + detection loss in AMP (bf16 / fp16) ─────────────
             t0 = time.time()
-            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
-                preds, R_maps, loss_mutual = net(
-                    img_dark, images, I_dark.detach(), I_light.detach())
-                loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+            _zero = torch.tensor(0.0, device=device)
+            loss_mutual_val  = _zero
+            loss_enhance2_val = _zero
+            loss_enhance_val = _zero
 
-            # ── Enhance losses: fp32 (EnhanceLoss has float32 conv kernels) ─
-            # Cast R_maps out of bf16 — gradients still flow back through .float()
-            R_dark, R_light, R_dark_2, R_light_2 = [r.float() for r in R_maps]
-            Rdg = R_dark_gt.detach();  Rlg = R_light_gt.detach()
+            if args.ablation == 'baseline':
+                # ── Baseline: detection only, no reflectance/KL ───────
+                with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
+                    preds = net.module.forward_detect(img_dark) if isinstance(net, nn.parallel.DistributedDataParallel) else net.forward_detect(img_dark)
+                    loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+                loss = (args.lambda_box * loss_box.float()
+                        + args.lambda_cls * loss_cls.float())
 
-            loss_enhance2 = (
-                F.l1_loss(R_dark,  Rdg) + F.l1_loss(R_light, Rlg) +
-                (1.0 - ssim(R_dark,  Rdg)) + (1.0 - ssim(R_light, Rlg))
-            )
-            loss_enhance = criterion_enhance(
-                [R_dark, R_light, R_dark_2, R_light_2,
-                 I_dark.detach().float(), I_light.detach().float()],
-                images, img_dark
-            ) * 0.1
+            else:
+                # ── RetinexNet: frozen, fp32, no grad ─────────────────
+                with torch.no_grad():
+                    R_dark_gt,  I_dark  = net_enh(img_dark)
+                    R_light_gt, I_light = net_enh(images)
 
-            # ── Combined loss (fp32) ───────────────────────────────────────
-            loss = (args.lambda_box * loss_box.float()
-                    + args.lambda_cls * loss_cls.float()
-                    + 0.3 * loss_enhance2
-                    + loss_enhance
-                    + 0.5 * loss_mutual.float())
+                if use_kl:
+                    # Full forward (reflectance + KL)
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
+                        preds, R_maps, loss_mutual = net(
+                            img_dark, images, I_dark.detach(), I_light.detach())
+                        loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+                    loss_mutual_val = loss_mutual
+                else:
+                    # Reflectance only (no KL)
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
+                        fwd_fn = net.module.forward_reflectance if isinstance(net, nn.parallel.DistributedDataParallel) else net.forward_reflectance
+                        preds, R_maps = fwd_fn(
+                            img_dark, images, I_dark.detach(), I_light.detach())
+                        loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+
+                # ── Enhance losses (fp32) ─────────────────────────────
+                R_dark, R_light, R_dark_2, R_light_2 = [r.float() for r in R_maps]
+                Rdg = R_dark_gt.detach();  Rlg = R_light_gt.detach()
+
+                loss_enhance2 = (
+                    F.l1_loss(R_dark,  Rdg) + F.l1_loss(R_light, Rlg) +
+                    (1.0 - ssim(R_dark,  Rdg)) + (1.0 - ssim(R_light, Rlg))
+                )
+                loss_enhance2_val = loss_enhance2
+
+                loss_enhance = _zero
+                if use_enhance:
+                    loss_enhance = criterion_enhance(
+                        [R_dark, R_light, R_dark_2, R_light_2,
+                         I_dark.detach().float(), I_light.detach().float()],
+                        images, img_dark
+                    ) * 0.1
+                loss_enhance_val = loss_enhance
+
+                # ── Combined loss (fp32) ──────────────────────────────
+                loss = (args.lambda_box * loss_box.float()
+                        + args.lambda_cls * loss_cls.float()
+                        + 0.3 * loss_enhance2
+                        + loss_enhance
+                        + 0.5 * loss_mutual_val.float())
 
             optimizer.zero_grad()
             if use_scaler:                          # fp16 path
@@ -395,6 +462,10 @@ def train():
             ema.update(core)
 
             epoch_loss += loss.item()
+            epoch_box  += loss_box.item()
+            epoch_cls  += loss_cls.item()
+            epoch_enh  += loss_enhance2_val.item()
+            epoch_kl   += loss_mutual_val.item()
             t1 = time.time()
 
             if batch_idx % 10 == 0 and local_rank == 0:
@@ -403,8 +474,8 @@ def train():
                     f'Loss {loss.item():.4f} '
                     f'(box {loss_box.item():.3f}  '
                     f'cls {loss_cls.item():.3f}  '
-                    f'enh {loss_enhance2.item():.3f}  '
-                    f'kl {loss_mutual.item():.3f}) | '
+                    f'enh {loss_enhance2_val.item():.3f}  '
+                    f'kl {loss_mutual_val.item():.3f}) | '
                     f'{t1 - t0:.3f}s/iter | '
                     f'LR {optimizer.param_groups[0]["lr"]:.2e}'
                 )
@@ -418,17 +489,37 @@ def train():
 
         # ── Validation (every N epochs + final epoch) ─────────────────────
         run_val = ((epoch + 1) % args.val_interval == 0) or (epoch + 1 == cfg.EPOCHES)
+        val_loss_ep = None
         if run_val:
-            val_loss = validate(ema.ema, net_enh, criterion_enhance)
+            val_loss_ep = validate(ema.ema, net_enh, criterion_enhance)
             if local_rank == 0:
-                print(f'[Epoch {epoch:03d}] val_loss={val_loss:.4f}')
+                print(f'[Epoch {epoch:03d}] val_loss={val_loss_ep:.4f}')
 
-                if val_loss < min_val_loss:
-                    min_val_loss = val_loss
+                if val_loss_ep < min_val_loss:
+                    min_val_loss = val_loss_ep
                     # Save EMA weights as best model (better generalisation)
                     torch.save(ema.ema.state_dict(),
                                os.path.join(save_folder, 'dsfd.pth'))
-                    print(f'[INFO] Best model saved  (val_loss={val_loss:.4f}, EMA)')
+                    print(f'[INFO] Best model saved  (val_loss={val_loss_ep:.4f}, EMA)')
+
+        # ── Save loss history to CSV ──────────────────────────────────────
+        if local_rank == 0:
+            n_batches = max(len(train_loader), 1)
+            row = {
+                'epoch':      epoch + 1,
+                'train_loss': f'{epoch_loss / n_batches:.6f}',
+                'train_box':  f'{epoch_box  / n_batches:.6f}',
+                'train_cls':  f'{epoch_cls  / n_batches:.6f}',
+                'train_enh':  f'{epoch_enh  / n_batches:.6f}',
+                'train_kl':   f'{epoch_kl   / n_batches:.6f}',
+                'val_loss':   f'{val_loss_ep:.6f}' if val_loss_ep is not None else '',
+                'lr':         f'{optimizer.param_groups[0]["lr"]:.6e}',
+            }
+            loss_history.append(row)
+            with open(loss_csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=csv_fields)
+                writer.writeheader()
+                writer.writerows(loss_history)
 
         # ── Checkpoints ───────────────────────────────────────────────────
         if local_rank == 0:
@@ -450,36 +541,58 @@ def validate(net_eval, net_enh, criterion_enhance):
     total_loss = 0.0
     steps      = 0
 
+    use_kl      = args.ablation in ('ref_kl', 'full')
+    use_enhance = args.ablation == 'full'
+
     with torch.no_grad():
         for images, img_dark, targets, _ in val_loader:
             images   = images.to(device, dtype=torch.float32) / 255.0
             img_dark = img_dark.to(device, dtype=torch.float32)
+            gt_list  = [t.to(device) for t in targets]
+            _zero    = torch.tensor(0.0, device=device)
 
-            R_dark_gt,  I_dark  = net_enh(img_dark)
-            R_light_gt, I_light = net_enh(images)
+            if args.ablation == 'baseline':
+                with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
+                    preds = net_eval.forward_detect(img_dark)
+                    loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+                loss = (args.lambda_box * loss_box.float()
+                        + args.lambda_cls * loss_cls.float())
+            else:
+                R_dark_gt,  I_dark  = net_enh(img_dark)
+                R_light_gt, I_light = net_enh(images)
 
-            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
-                preds, R_maps, loss_mutual = net_eval(
-                    img_dark, images, I_dark.detach(), I_light.detach())
-                gt_list   = [t.to(device) for t in targets]
-                loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+                if use_kl:
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
+                        preds, R_maps, loss_mutual = net_eval(
+                            img_dark, images, I_dark.detach(), I_light.detach())
+                        loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+                else:
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=args.amp):
+                        preds, R_maps = net_eval.forward_reflectance(
+                            img_dark, images, I_dark.detach(), I_light.detach())
+                        loss_box, loss_cls = compute_detection_loss(preds, gt_list, device)
+                    loss_mutual = _zero
 
-            R_dark, R_light, R_dark_2, R_light_2 = [r.float() for r in R_maps]
-            Rdg = R_dark_gt;  Rlg = R_light_gt
+                R_dark, R_light, R_dark_2, R_light_2 = [r.float() for r in R_maps]
+                Rdg = R_dark_gt;  Rlg = R_light_gt
 
-            loss_enhance2 = (
-                F.l1_loss(R_dark,  Rdg) + F.l1_loss(R_light, Rlg) +
-                (1.0 - ssim(R_dark,  Rdg)) + (1.0 - ssim(R_light, Rlg))
-            )
-            loss_enhance = criterion_enhance(
-                [R_dark, R_light, R_dark_2, R_light_2,
-                 I_dark.detach().float(), I_light.detach().float()],
-                images, img_dark
-            ) * 0.1
+                loss_enhance2 = (
+                    F.l1_loss(R_dark,  Rdg) + F.l1_loss(R_light, Rlg) +
+                    (1.0 - ssim(R_dark,  Rdg)) + (1.0 - ssim(R_light, Rlg))
+                )
+                loss_enhance = _zero
+                if use_enhance:
+                    loss_enhance = criterion_enhance(
+                        [R_dark, R_light, R_dark_2, R_light_2,
+                         I_dark.detach().float(), I_light.detach().float()],
+                        images, img_dark
+                    ) * 0.1
 
-            loss = (args.lambda_box * loss_box.float()
-                    + args.lambda_cls * loss_cls.float()
-                    + 0.3 * loss_enhance2 + loss_enhance + 0.5 * loss_mutual.float())
+                loss = (args.lambda_box * loss_box.float()
+                        + args.lambda_cls * loss_cls.float()
+                        + 0.3 * loss_enhance2 + loss_enhance
+                        + 0.5 * loss_mutual.float())
+
             total_loss += loss.item()
             steps      += 1
 

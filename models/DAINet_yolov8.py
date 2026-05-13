@@ -430,6 +430,53 @@ class DAINetYOLO(nn.Module):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
+    # ── Detect-only forward (ablation baseline) ─────────────────────
+    def forward_detect(self, x):
+        """
+        Detection-only forward — no reflectance branch, no KL alignment.
+        Used for ablation baseline training.
+
+        x : (B, 3, H, W)  input image [0, 1]
+
+        Returns
+        -------
+        preds : list[3] of (reg (B,4,H,W), cls (B,nc,H,W))
+        """
+        stem, P3, P4, P5 = self.backbone(x)
+        N3, N4, N5 = self.neck(P3, P4, P5)
+        preds = [head(feat) for head, feat in zip(self.heads, [N3, N4, N5])]
+        return preds
+
+    # ── Forward with reflectance but no KL (ablation variant 2) ───
+    def forward_reflectance(self, x_dark, x_light, I_dark, I_light):
+        """
+        Forward with reflectance decoder but without mutual KL alignment.
+        Used for ablation variant 2.
+
+        Returns
+        -------
+        preds  : list[3] of (reg, cls)
+        R_maps : [R_dark, R_light, R_dark_2, R_light_2]
+        """
+        stem_dark, P3_d, P4_d, P5_d = self.backbone(x_dark)
+        R_dark = self.ref(stem_dark)
+
+        stem_light = self.backbone.stem(x_light)
+        R_light = self.ref(stem_light)
+
+        x_dark_2  = (I_light * R_dark).detach()
+        x_light_2 = (I_dark  * R_light).detach()
+
+        stem_d2 = self.backbone.stem(x_dark_2)
+        stem_l2 = self.backbone.stem(x_light_2)
+        R_dark_2  = self.ref(stem_l2)
+        R_light_2 = self.ref(stem_d2)
+
+        N3, N4, N5 = self.neck(P3_d, P4_d, P5_d)
+        preds = [head(feat) for head, feat in zip(self.heads, [N3, N4, N5])]
+
+        return preds, [R_dark, R_light, R_dark_2, R_light_2]
+
     # ── Training forward ─────────────────────────────────────────────
     def forward(self, x_dark, x_light, I_dark, I_light):
         """
